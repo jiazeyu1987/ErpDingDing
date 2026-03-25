@@ -1,0 +1,45 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual env
+.venv/
+venv/
+env/
+
+# Local env/config
+.env
+.env.*
+!.env.example
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Logs / runtime
+*.log
+*.out
+*.pid
+
+# Databases
+*.db
+*.sqlite
+*.sqlite3
+
+# Data exports
+*.csv
+*.xlsx
+*.xls
+*.jsonl
+
+# Build / temp
+build/
+dist/
+tmp/
+temp/
+
+# Project-generated folders
+out_*/
