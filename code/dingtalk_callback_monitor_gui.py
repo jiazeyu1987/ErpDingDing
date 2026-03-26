@@ -268,6 +268,23 @@ def parse_json(text: str) -> Any:
         return text
 
 
+def parse_originator_map_text(raw: str) -> dict[str, str]:
+    out: dict[str, str] = {}
+    text = str(raw or "").strip()
+    if not text:
+        return out
+    for segment in text.replace(";", ",").split(","):
+        item = segment.strip()
+        if not item or "=" not in item:
+            continue
+        key, val = item.split("=", 1)
+        key = key.strip()
+        val = val.strip()
+        if key and val:
+            out[key] = val
+    return out
+
+
 def service_urls(base_url: str, service_name: str) -> list[str]:
     base = base_url.rstrip("/")
     return [
@@ -336,6 +353,7 @@ class CallbackMonitorGUI(tk.Tk):
 
         self._build_vars()
         self._build_ui()
+        self._refresh_user_mapping_view()
         self.after(200, self._poll_queue)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -488,6 +506,23 @@ class CallbackMonitorGUI(tk.Tk):
         ttk.Label(q_row1, textvariable=self.po_monitor_status_var).pack(side=tk.LEFT, padx=16)
         ttk.Label(q_row1, textvariable=self.create_status_var).pack(side=tk.LEFT, padx=8)
         ttk.Label(q_row1, textvariable=self.wb_retry_status_var).pack(side=tk.LEFT, padx=8)
+
+        quick_map = ttk.LabelFrame(tab_quick, text="User Mapping (ERP -> DingTalk)", padding=(8, 8))
+        quick_map.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
+        cols_um = ("erp_key", "erp_id", "erp_name", "dingtalk_user_id", "dingtalk_user_name", "source")
+        self.tree_user_map = ttk.Treeview(quick_map, columns=cols_um, show="headings", height=12)
+        for c in cols_um:
+            self.tree_user_map.heading(c, text=c)
+        self.tree_user_map.column("erp_key", width=140, anchor=tk.W)
+        self.tree_user_map.column("erp_id", width=100, anchor=tk.CENTER)
+        self.tree_user_map.column("erp_name", width=120, anchor=tk.W)
+        self.tree_user_map.column("dingtalk_user_id", width=160, anchor=tk.W)
+        self.tree_user_map.column("dingtalk_user_name", width=100, anchor=tk.W)
+        self.tree_user_map.column("source", width=100, anchor=tk.CENTER)
+        yq = ttk.Scrollbar(quick_map, orient=tk.VERTICAL, command=self.tree_user_map.yview)
+        self.tree_user_map.configure(yscrollcommand=yq.set)
+        self.tree_user_map.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        yq.pack(side=tk.RIGHT, fill=tk.Y)
 
         top = ttk.Frame(tab_main, padding=10)
         top.pack(fill=tk.X)
@@ -780,6 +815,62 @@ class CallbackMonitorGUI(tk.Tk):
     def _clear_log(self) -> None:
         self.log_text.delete("1.0", tk.END)
 
+    def _collect_originator_mapping_rows(self) -> list[dict[str, str]]:
+        merged: dict[str, tuple[str, str]] = {}
+
+        for erp_name, dingtalk_user_id in DINGTALK_USER_CHOICES:
+            merged[str(erp_name).strip()] = ("preset-name", str(dingtalk_user_id).strip())
+
+        for erp_key, dingtalk_user_id in DINGTALK_ERP_CREATOR_TO_USER_ID.items():
+            merged[str(erp_key).strip()] = ("preset-erp", str(dingtalk_user_id).strip())
+
+        env_map_text = ""
+        try:
+            env_values = cb.load_env_file(self.env_file_var.get().strip())
+            env_map_text = cb.first_non_empty(env_values.get("DINGTALK_ORIGINATOR_MAP"))
+        except Exception:
+            env_map_text = ""
+        for erp_key, dingtalk_user_id in parse_originator_map_text(env_map_text).items():
+            merged[str(erp_key).strip()] = ("env", str(dingtalk_user_id).strip())
+
+        rows: list[dict[str, str]] = []
+        for erp_key in sorted(merged.keys(), key=lambda x: (x.isdigit(), x)):
+            source, dingtalk_user_id = merged[erp_key]
+            dingtalk_user_name = DINGTALK_USER_ID_TO_NAME.get(dingtalk_user_id, "")
+            erp_id = erp_key if erp_key.isdigit() else ""
+            erp_name = erp_key if not erp_key.isdigit() else ""
+            rows.append(
+                {
+                    "erp_key": erp_key,
+                    "erp_id": erp_id,
+                    "erp_name": erp_name,
+                    "dingtalk_user_id": dingtalk_user_id,
+                    "dingtalk_user_name": dingtalk_user_name,
+                    "source": source,
+                }
+            )
+        return rows
+
+    def _refresh_user_mapping_view(self) -> None:
+        tree = getattr(self, "tree_user_map", None)
+        if tree is None:
+            return
+        rows = self._collect_originator_mapping_rows()
+        tree.delete(*tree.get_children())
+        for row in rows:
+            tree.insert(
+                "",
+                tk.END,
+                values=(
+                    row.get("erp_key", ""),
+                    row.get("erp_id", ""),
+                    row.get("erp_name", ""),
+                    row.get("dingtalk_user_id", ""),
+                    row.get("dingtalk_user_name", ""),
+                    row.get("source", ""),
+                ),
+            )
+
     def _load_env(self) -> None:
         env = cb.load_env_file(self.env_file_var.get().strip())
         self.dt_api_base_var.set(cb.first_non_empty(env.get("DINGTALK_API_BASE"), self.dt_api_base_var.get()))
@@ -827,6 +918,7 @@ class CallbackMonitorGUI(tk.Tk):
         self.erp_wf_approval_type_var.set(
             cb.first_non_empty(env.get("ERP_DD_WORKFLOW_APPROVAL_TYPE"), self.erp_wf_approval_type_var.get())
         )
+        self._refresh_user_mapping_view()
         self._log(f"[{now_iso()}] loaded env: {self.env_file_var.get().strip()}")
 
     def _build_writeback_service(self, *, login: bool = True) -> ErpWritebackService:
