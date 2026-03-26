@@ -240,6 +240,7 @@ class ServerConfig:
     shared_token: str
     mapping_db: str
     writeback_on: str
+    defer_writeback: bool = False
 
 
 class CallbackApp:
@@ -299,6 +300,22 @@ class CallbackApp:
             callback_time=callback_time,
             raw_payload=payload,
         )
+
+        if self.server_config.defer_writeback:
+            response["message"] = "callback stored; writeback deferred"
+            response["queued"] = True
+            print_line(
+                {
+                    "level": "info",
+                    "event": "writeback_queued",
+                    "processInstanceId": process_instance_id,
+                    "poFid": link.get("po_fid"),
+                    "poBillNo": link.get("po_bill_no"),
+                    "status": status,
+                    "mode": self.server_config.writeback_on,
+                }
+            )
+            return response
 
         if not should_writeback(status, self.server_config.writeback_on):
             response["message"] = f"skip writeback for status={status} with mode={self.server_config.writeback_on}"
@@ -451,6 +468,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--shared-token", default="", help="Optional custom header token: X-Callback-Token.")
     p.add_argument("--mapping-db", default=DEFAULT_MAPPING_DB)
     p.add_argument("--writeback-on", choices=["approved", "terminal", "all"], default="approved")
+    p.add_argument(
+        "--defer-writeback",
+        action="store_true",
+        help="Only store callback to DB; do not write ERP immediately.",
+    )
 
     p.add_argument("--dingtalk-callback-token", default="")
     p.add_argument("--dingtalk-callback-aes-key", default="")
@@ -564,6 +586,7 @@ def main() -> int:
         shared_token=args.shared_token,
         mapping_db=args.mapping_db,
         writeback_on=args.writeback_on,
+        defer_writeback=args.defer_writeback,
     )
     app = CallbackApp(
         server_config=server_cfg,

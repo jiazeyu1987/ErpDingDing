@@ -153,6 +153,55 @@ def list_poll_targets(db_path: str, *, days: int, limit: int) -> list[dict[str, 
         conn.close()
 
 
+def parse_iso_datetime(text: str) -> dt.datetime | None:
+    raw = str(text or "").strip()
+    if not raw:
+        return None
+    for candidate in (raw, raw.replace(" ", "T")):
+        try:
+            return dt.datetime.fromisoformat(candidate)
+        except Exception:  # noqa: BLE001
+            continue
+    return None
+
+
+def list_pending_writeback_links(db_path: str, limit: int = 200) -> list[dict[str, Any]]:
+    p = Path(db_path)
+    if not p.exists():
+        return []
+    conn = sqlite3.connect(str(p))
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute(
+            """
+            SELECT
+              process_instance_id, po_fid, po_bill_no,
+              callback_status, callback_result, callback_time,
+              erp_writeback_ok, erp_writeback_msg, erp_writeback_time, updated_at
+            FROM dingtalk_po_links
+            WHERE ifnull(trim(process_instance_id), '') <> ''
+              AND ifnull(trim(po_fid), '') <> ''
+              AND ifnull(trim(callback_status), '') <> ''
+              AND ifnull(erp_writeback_ok, 0) <> 1
+            ORDER BY
+              CASE WHEN ifnull(trim(callback_time), '') = '' THEN updated_at ELSE callback_time END ASC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+WRITEBACK_TIMEOUT_MARKER = "[retry-timeout]"
+TERMINAL_DINGTALK_STATUSES = {"APPROVED", "REJECTED", "CANCELED", "CANCELLED", "TERMINATED"}
+
+
+def is_retry_timeout_writeback_message(message: str) -> bool:
+    return WRITEBACK_TIMEOUT_MARKER in str(message or "").lower()
+
+
 def ensure_json_response(resp: requests.Response) -> dict[str, Any]:
     try:
         data = resp.json()
@@ -267,8 +316,9 @@ class CallbackMonitorGUI(tk.Tk):
         self.dt_poll_running = False
         self.dt_poll_stop_event = threading.Event()
         self.dt_poll_last_sig: dict[str, str] = {}
-        self.dt_poll_retry_after: dict[str, float] = {}
-        self.dt_poll_fail_count: dict[str, int] = {}
+        self.wb_retry_thread: threading.Thread | None = None
+        self.wb_retry_running = False
+        self.wb_retry_stop_event = threading.Event()
 
         self._build_vars()
         self._build_ui()
@@ -333,6 +383,9 @@ class CallbackMonitorGUI(tk.Tk):
         self.dt_poll_interval_var = tk.StringVar(value="8")
         self.dt_poll_auto_writeback_var = tk.BooleanVar(value=True)
         self.dt_poll_status_var = tk.StringVar(value="DingTalk Poll: stopped")
+        self.wb_retry_interval_var = tk.StringVar(value="10")
+        self.wb_retry_max_minutes_var = tk.StringVar(value="30")
+        self.wb_retry_status_var = tk.StringVar(value="Writeback Retry: stopped")
         self.quick_originator_name_var = tk.StringVar(
             value=DINGTALK_USER_ID_TO_NAME.get(DEFAULT_DINGTALK_ORIGINATOR_ID, DINGTALK_USER_CHOICES[0][0])
         )
@@ -391,6 +444,7 @@ class CallbackMonitorGUI(tk.Tk):
         ttk.Button(q_row1, text="采购订单", command=self._create_random_po).pack(side=tk.LEFT, padx=12)
         ttk.Label(q_row1, textvariable=self.po_monitor_status_var).pack(side=tk.LEFT, padx=16)
         ttk.Label(q_row1, textvariable=self.create_status_var).pack(side=tk.LEFT, padx=8)
+        ttk.Label(q_row1, textvariable=self.wb_retry_status_var).pack(side=tk.LEFT, padx=8)
 
         top = ttk.Frame(tab_main, padding=10)
         top.pack(fill=tk.X)
@@ -553,6 +607,10 @@ class CallbackMonitorGUI(tk.Tk):
         ttk.Checkbutton(row7b, text="Auto ERP Writeback", variable=self.dt_poll_auto_writeback_var).pack(
             side=tk.LEFT, padx=8
         )
+        ttk.Label(row7b, text="WB Retry(s)").pack(side=tk.LEFT)
+        ttk.Entry(row7b, textvariable=self.wb_retry_interval_var, width=5).pack(side=tk.LEFT, padx=4)
+        ttk.Label(row7b, text="WB Max(min)").pack(side=tk.LEFT)
+        ttk.Entry(row7b, textvariable=self.wb_retry_max_minutes_var, width=5).pack(side=tk.LEFT, padx=4)
         self.dt_poll_start_btn = ttk.Button(row7b, text="Start DingTalk Poll", command=self._start_dt_poll)
         self.dt_poll_start_btn.pack(side=tk.LEFT, padx=(8, 4))
         self.dt_poll_stop_btn = ttk.Button(
@@ -718,7 +776,7 @@ class CallbackMonitorGUI(tk.Tk):
         )
         self._log(f"[{now_iso()}] loaded env: {self.env_file_var.get().strip()}")
 
-    def _build_writeback_service(self) -> ErpWritebackService:
+    def _build_writeback_service(self, *, login: bool = True) -> ErpWritebackService:
         cfg = ErpWritebackConfig(
             base_url=self.erp_base_var.get().strip(),
             acct_id=self.erp_acct_var.get().strip(),
@@ -742,7 +800,8 @@ class CallbackMonitorGUI(tk.Tk):
             workflow_approval_type=self.erp_wf_approval_type_var.get().strip() or "1",
         )
         svc = ErpWritebackService(cfg)
-        svc.login()
+        if login:
+            svc.login()
         return svc
 
     def _start_server(self) -> None:
@@ -758,7 +817,7 @@ class CallbackMonitorGUI(tk.Tk):
             cb_token = self.cb_token_var.get().strip()
             cb_aes = self.cb_aes_var.get().strip()
 
-            writeback_service = self._build_writeback_service()
+            writeback_service = self._build_writeback_service(login=False)
             crypto = None
             if cb_token and cb_aes:
                 crypto = cb.DingTalkCrypto(cb.DingTalkCryptoConfig(token=cb_token, aes_key=cb_aes))
@@ -770,6 +829,7 @@ class CallbackMonitorGUI(tk.Tk):
                 shared_token=shared_token,
                 mapping_db=mapping_db,
                 writeback_on=writeback_on,
+                defer_writeback=True,
             )
             app = cb.CallbackApp(
                 server_config=server_cfg,
@@ -795,6 +855,7 @@ class CallbackMonitorGUI(tk.Tk):
                 f"[{now_iso()}] writeback mode={writeback_on}, "
                 f"erp approve mode={self.erp_approve_mode_var.get().strip() or 'submit_audit'}"
             )
+            self._log(f"[{now_iso()}] callback defer writeback: enabled")
             self._log(
                 f"[{now_iso()}] workflow params: userId={self.erp_wf_user_id_var.get().strip() or '-'}, "
                 f"userName={self.erp_wf_user_name_var.get().strip() or '-'}, "
@@ -802,6 +863,10 @@ class CallbackMonitorGUI(tk.Tk):
                 f"postNo={self.erp_wf_post_no_var.get().strip() or '-'}, "
                 f"approvalType={self.erp_wf_approval_type_var.get().strip() or '1'}"
             )
+            if self.dt_poll_auto_writeback_var.get():
+                self._start_wb_retry()
+            else:
+                self.wb_retry_status_var.set("Writeback Retry: disabled")
             self._refresh_mapping()
             self._log(f"[{now_iso()}] tip: click 'Start ERP Watch' to detect new ERP purchase orders")
         except Exception as exc:  # noqa: BLE001
@@ -822,6 +887,7 @@ class CallbackMonitorGUI(tk.Tk):
         self.start_btn.configure(state=tk.NORMAL)
         self.stop_btn.configure(state=tk.DISABLED)
         self.status_var.set("Stopped")
+        self._stop_wb_retry()
         self._log(f"[{now_iso()}] callback server stopped")
 
     def _simulate_callback(self) -> None:
@@ -1102,7 +1168,6 @@ class CallbackMonitorGUI(tk.Tk):
                 "timeout": int(self.erp_timeout_var.get().strip()),
                 "writeback_on": self.writeback_on_var.get().strip() or "approved",
                 "auto_writeback": self.dt_poll_auto_writeback_var.get(),
-                "retry_cooldown": 60.0,
             }
             if not params["api_base"]:
                 raise ValueError("DingTalk API base is required.")
@@ -1115,14 +1180,14 @@ class CallbackMonitorGUI(tk.Tk):
 
             self.dt_poll_stop_event.clear()
             self.dt_poll_last_sig.clear()
-            self.dt_poll_retry_after.clear()
-            self.dt_poll_fail_count.clear()
             self.dt_poll_thread = threading.Thread(target=self._dingtalk_poll_worker, args=(params,), daemon=True)
             self.dt_poll_thread.start()
             self.dt_poll_running = True
             self.dt_poll_start_btn.configure(state=tk.DISABLED)
             self.dt_poll_stop_btn.configure(state=tk.NORMAL)
             self.dt_poll_status_var.set("DingTalk Poll: running")
+            if params["auto_writeback"]:
+                self._start_wb_retry()
             self._log(
                 f"[{now_iso()}] DingTalk poll started "
                 f"(days={params['days']}, limit={params['limit']}, interval={params['interval']}s)"
@@ -1141,7 +1206,6 @@ class CallbackMonitorGUI(tk.Tk):
 
     def _dingtalk_poll_worker(self, params: dict[str, Any]) -> None:
         session = requests.Session()
-        writeback_service: ErpWritebackService | None = None
         try:
             token = dingtalk_get_token(
                 session=session,
@@ -1153,12 +1217,11 @@ class CallbackMonitorGUI(tk.Tk):
             self.msg_queue.put(("text", f"[{now_iso()}] DingTalk poll token acquired"))
 
             if params["auto_writeback"]:
-                writeback_service = self._build_writeback_service()
                 self.msg_queue.put(
                     (
                         "text",
-                        f"[{now_iso()}] DingTalk poll writeback enabled "
-                        f"(mode={params['writeback_on']})",
+                        f"[{now_iso()}] DingTalk poll writeback delegated "
+                        f"to retry worker (mode={params['writeback_on']})",
                     )
                 )
             else:
@@ -1301,79 +1364,6 @@ class CallbackMonitorGUI(tk.Tk):
                                 )
                             )
 
-                    if (
-                        not params["auto_writeback"]
-                        or writeback_service is None
-                        or mapped_status in {"", "UNKNOWN", "RUNNING"}
-                        or not cb.should_writeback(mapped_status, params["writeback_on"])
-                    ):
-                        continue
-
-                    prev_ok_val = row.get("erp_writeback_ok")
-                    prev_ok_text = (str(prev_ok_val).strip().lower() if prev_ok_val is not None else "")
-                    already_ok = prev_ok_text in {"1", "true"}
-                    prev_fail_msg = str(row.get("erp_writeback_msg") or "")
-                    status_changed = mapped_status != prev_status
-                    if (not status_changed) and already_ok:
-                        continue
-                    if (not status_changed) and (not already_ok) and is_non_retryable_writeback_message(prev_fail_msg):
-                        continue
-
-                    retry_key = f"{process_instance_id}:{mapped_status}"
-                    fail_count = self.dt_poll_fail_count.get(retry_key, 0)
-                    prev_retryable = is_retryable_writeback_message(prev_fail_msg)
-                    if (not status_changed) and (not prev_retryable) and fail_count >= 3:
-                        continue
-                    now_ts = time.time()
-                    retry_after = self.dt_poll_retry_after.get(retry_key, 0.0)
-                    if now_ts < retry_after:
-                        continue
-
-                    try:
-                        ok, msg = writeback_service.writeback(
-                            po_fid=po_fid,
-                            po_bill_no=po_bill_no,
-                            process_instance_id=process_instance_id,
-                            callback_status=mapped_status,
-                            callback_result=raw_result,
-                            callback_time=callback_time,
-                        )
-                    except Exception as exc:  # noqa: BLE001
-                        ok = False
-                        msg = str(exc)
-
-                    update_writeback_result(
-                        params["mapping_db"],
-                        process_instance_id=process_instance_id,
-                        ok=ok,
-                        message=msg,
-                    )
-                    if ok:
-                        self.dt_poll_retry_after.pop(retry_key, None)
-                        self.dt_poll_fail_count.pop(retry_key, None)
-                    else:
-                        retryable_now = is_retryable_writeback_message(msg)
-                        if retryable_now:
-                            # Document is temporarily locked/in use. Keep retrying with short cooldown.
-                            self.dt_poll_retry_after[retry_key] = now_ts + 10.0
-                            self.dt_poll_fail_count[retry_key] = fail_count
-                        else:
-                            self.dt_poll_retry_after[retry_key] = now_ts + float(params["retry_cooldown"])
-                            self.dt_poll_fail_count[retry_key] = fail_count + 1
-                    self.msg_queue.put(
-                        (
-                            "dt_writeback",
-                            {
-                                "processInstanceId": process_instance_id,
-                                "poFid": po_fid,
-                                "poBillNo": po_bill_no,
-                                "status": mapped_status,
-                                "ok": ok,
-                                "message": msg,
-                            },
-                        )
-                    )
-
                 if self.dt_poll_stop_event.wait(params["interval"]):
                     break
         except Exception as exc:  # noqa: BLE001
@@ -1459,6 +1449,236 @@ class CallbackMonitorGUI(tk.Tk):
         except Exception as exc:  # noqa: BLE001
             self.msg_queue.put(("po_create_failed", str(exc)))
 
+    def _start_wb_retry(self) -> None:
+        if self.wb_retry_running:
+            return
+        if not self.dt_poll_auto_writeback_var.get():
+            self.wb_retry_status_var.set("Writeback Retry: disabled")
+            return
+        try:
+            mapping_db = self.mapping_db_var.get().strip()
+            if not mapping_db:
+                raise ValueError("Mapping DB path is required.")
+
+            interval_raw = float(self.wb_retry_interval_var.get().strip())
+            interval_sec = max(10.0, min(30.0, interval_raw))
+            if abs(interval_sec - interval_raw) > 1e-9:
+                self._log(
+                    f"[{now_iso()}] writeback retry interval clamped: {interval_raw}s -> {interval_sec}s "
+                    "(required 10-30s)"
+                )
+                shown = str(int(interval_sec)) if float(interval_sec).is_integer() else str(interval_sec)
+                self.wb_retry_interval_var.set(shown)
+
+            max_minutes = float(self.wb_retry_max_minutes_var.get().strip())
+            if max_minutes <= 0:
+                raise ValueError("Writeback max minutes must be > 0.")
+
+            scan_limit = int(self.dt_poll_limit_var.get().strip())
+            if scan_limit <= 0:
+                scan_limit = 200
+
+            params = {
+                "mapping_db": mapping_db,
+                "interval": interval_sec,
+                "max_minutes": max_minutes,
+                "max_seconds": max_minutes * 60.0,
+                "scan_limit": max(50, min(1000, scan_limit)),
+                "writeback_on": self.writeback_on_var.get().strip() or "approved",
+            }
+            self.wb_retry_stop_event.clear()
+            self.wb_retry_thread = threading.Thread(target=self._writeback_retry_worker, args=(params,), daemon=True)
+            self.wb_retry_thread.start()
+            self.wb_retry_running = True
+            self.wb_retry_status_var.set(
+                f"Writeback Retry: running ({int(params['interval'])}s/{int(params['max_minutes'])}m)"
+            )
+            self._log(
+                f"[{now_iso()}] writeback retry started "
+                f"(interval={params['interval']}s, max={params['max_minutes']}m, mode={params['writeback_on']})"
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.wb_retry_running = False
+            self.wb_retry_thread = None
+            self.wb_retry_status_var.set("Writeback Retry: failed")
+            self._log(f"[{now_iso()}] writeback retry start failed: {exc}")
+
+    def _stop_wb_retry(self) -> None:
+        if not self.wb_retry_running:
+            self.wb_retry_status_var.set("Writeback Retry: stopped")
+            return
+        self.wb_retry_stop_event.set()
+        self.wb_retry_running = False
+        self.wb_retry_status_var.set("Writeback Retry: stopping")
+        self._log(f"[{now_iso()}] writeback retry stopping...")
+
+    def _writeback_retry_worker(self, params: dict[str, Any]) -> None:
+        writeback_service: ErpWritebackService | None = None
+        retry_after: dict[str, float] = {}
+        try:
+            self.msg_queue.put(("wb_retry_started", params))
+            while not self.wb_retry_stop_event.is_set():
+                if writeback_service is None:
+                    try:
+                        writeback_service = self._build_writeback_service()
+                    except Exception as exc:  # noqa: BLE001
+                        self.msg_queue.put(("text", f"[{now_iso()}] writeback retry login failed: {exc}"))
+                        if self.wb_retry_stop_event.wait(params["interval"]):
+                            break
+                        continue
+
+                try:
+                    rows = list_pending_writeback_links(params["mapping_db"], limit=params["scan_limit"])
+                except Exception as exc:  # noqa: BLE001
+                    self.msg_queue.put(("text", f"[{now_iso()}] load pending writeback rows failed: {exc}"))
+                    if self.wb_retry_stop_event.wait(params["interval"]):
+                        break
+                    continue
+
+                now_dt = dt.datetime.now()
+                now_ts = time.time()
+                for row in rows:
+                    if self.wb_retry_stop_event.is_set():
+                        break
+
+                    process_instance_id = str(row.get("process_instance_id") or "").strip()
+                    po_fid = str(row.get("po_fid") or "").strip()
+                    po_bill_no = str(row.get("po_bill_no") or "").strip()
+                    callback_status = str(row.get("callback_status") or "").strip().upper()
+                    callback_result = str(row.get("callback_result") or "").strip()
+                    callback_time = str(row.get("callback_time") or "").strip() or now_iso()
+
+                    if not process_instance_id or not po_fid or callback_status in {"", "UNKNOWN"}:
+                        continue
+
+                    if not cb.should_writeback(callback_status, params["writeback_on"]):
+                        if callback_status in TERMINAL_DINGTALK_STATUSES:
+                            skip_msg = (
+                                f"skip writeback for status={callback_status} "
+                                f"with mode={params['writeback_on']}"
+                            )
+                            update_writeback_result(
+                                params["mapping_db"],
+                                process_instance_id=process_instance_id,
+                                ok=True,
+                                message=skip_msg,
+                            )
+                            self.msg_queue.put(
+                                (
+                                    "wb_writeback",
+                                    {
+                                        "processInstanceId": process_instance_id,
+                                        "poFid": po_fid,
+                                        "poBillNo": po_bill_no,
+                                        "status": callback_status,
+                                        "ok": True,
+                                        "message": skip_msg,
+                                        "skip": True,
+                                    },
+                                )
+                            )
+                        continue
+
+                    prev_ok_val = row.get("erp_writeback_ok")
+                    prev_ok_text = str(prev_ok_val).strip().lower() if prev_ok_val is not None else ""
+                    if prev_ok_text in {"1", "true"}:
+                        continue
+
+                    prev_msg = str(row.get("erp_writeback_msg") or "")
+                    if is_non_retryable_writeback_message(prev_msg):
+                        continue
+                    if is_retry_timeout_writeback_message(prev_msg):
+                        continue
+
+                    callback_dt = parse_iso_datetime(callback_time) or parse_iso_datetime(
+                        str(row.get("updated_at") or "")
+                    )
+                    if callback_dt is not None:
+                        elapsed_sec = (now_dt - callback_dt).total_seconds()
+                        if elapsed_sec > float(params["max_seconds"]):
+                            timeout_msg = (
+                                f"{WRITEBACK_TIMEOUT_MARKER} exceeded {int(params['max_minutes'])} minutes "
+                                f"for status={callback_status}"
+                            )
+                            update_writeback_result(
+                                params["mapping_db"],
+                                process_instance_id=process_instance_id,
+                                ok=False,
+                                message=timeout_msg,
+                            )
+                            self.msg_queue.put(
+                                (
+                                    "wb_writeback",
+                                    {
+                                        "processInstanceId": process_instance_id,
+                                        "poFid": po_fid,
+                                        "poBillNo": po_bill_no,
+                                        "status": callback_status,
+                                        "ok": False,
+                                        "message": timeout_msg,
+                                        "timeout": True,
+                                    },
+                                )
+                            )
+                            retry_after.pop(f"{process_instance_id}:{callback_status}", None)
+                            continue
+
+                    retry_key = f"{process_instance_id}:{callback_status}"
+                    if now_ts < retry_after.get(retry_key, 0.0):
+                        continue
+
+                    try:
+                        ok, msg = writeback_service.writeback(
+                            po_fid=po_fid,
+                            po_bill_no=po_bill_no,
+                            process_instance_id=process_instance_id,
+                            callback_status=callback_status,
+                            callback_result=callback_result,
+                            callback_time=callback_time,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        ok = False
+                        msg = str(exc)
+                        if any(mark in msg.lower() for mark in ("login", "session", "context", "403", "401")):
+                            writeback_service = None
+
+                    update_writeback_result(
+                        params["mapping_db"],
+                        process_instance_id=process_instance_id,
+                        ok=ok,
+                        message=msg,
+                    )
+
+                    retryable_now = is_retryable_writeback_message(msg)
+                    non_retryable_now = is_non_retryable_writeback_message(msg)
+                    if ok or non_retryable_now:
+                        retry_after.pop(retry_key, None)
+                    else:
+                        retry_after[retry_key] = time.time() + float(params["interval"])
+
+                    self.msg_queue.put(
+                        (
+                            "wb_writeback",
+                            {
+                                "processInstanceId": process_instance_id,
+                                "poFid": po_fid,
+                                "poBillNo": po_bill_no,
+                                "status": callback_status,
+                                "ok": ok,
+                                "message": msg,
+                                "retryable": retryable_now,
+                                "nonRetryable": non_retryable_now,
+                            },
+                        )
+                    )
+
+                if self.wb_retry_stop_event.wait(params["interval"]):
+                    break
+        except Exception as exc:  # noqa: BLE001
+            self.msg_queue.put(("text", f"[{now_iso()}] writeback retry worker error: {exc}"))
+        finally:
+            self.msg_queue.put(("wb_retry_stopped", None))
+
     def _start_all(self) -> None:
         if not self.server_running:
             self._start_server()
@@ -1468,9 +1688,12 @@ class CallbackMonitorGUI(tk.Tk):
             self._start_po_monitor()
         if not self.dt_poll_running:
             self._start_dt_poll()
+        if self.dt_poll_auto_writeback_var.get():
+            self._start_wb_retry()
         self._log(f"[{now_iso()}] full flow started")
 
     def _stop_all(self) -> None:
+        self._stop_wb_retry()
         self._stop_dt_poll()
         self._stop_po_monitor()
         self._stop_erp_watch()
@@ -1732,6 +1955,44 @@ class CallbackMonitorGUI(tk.Tk):
                     f"status={info.get('status','')} result={info.get('result','')}"
                 )
                 self._refresh_mapping()
+            elif kind == "wb_retry_started":
+                info = dict(payload)
+                self.wb_retry_running = True
+                self.wb_retry_status_var.set(
+                    f"Writeback Retry: running ({int(float(info.get('interval', 10)))}s/"
+                    f"{int(float(info.get('max_minutes', 30)))}m)"
+                )
+            elif kind == "wb_writeback":
+                info = dict(payload)
+                if info.get("skip"):
+                    self._log(
+                        f"[{now_iso()}] writeback skipped by mode: "
+                        f"PID={info.get('processInstanceId','')} "
+                        f"PO={info.get('poBillNo','')} status={info.get('status','')} "
+                        f"msg={info.get('message','')}"
+                    )
+                elif info.get("timeout"):
+                    self._log(
+                        f"[{now_iso()}] writeback timeout: "
+                        f"PID={info.get('processInstanceId','')} "
+                        f"PO={info.get('poBillNo','')} status={info.get('status','')} "
+                        f"msg={info.get('message','')}"
+                    )
+                else:
+                    self._log(
+                        f"[{now_iso()}] retry writeback "
+                        f"{'ok' if info.get('ok') else 'failed'}: "
+                        f"PID={info.get('processInstanceId','')} "
+                        f"PO={info.get('poBillNo','')} status={info.get('status','')} "
+                        f"retryable={bool(info.get('retryable'))} "
+                        f"msg={info.get('message','')}"
+                    )
+                self._refresh_mapping()
+            elif kind == "wb_retry_stopped":
+                self.wb_retry_running = False
+                self.wb_retry_thread = None
+                self.wb_retry_status_var.set("Writeback Retry: stopped")
+                self._log(f"[{now_iso()}] writeback retry stopped")
             elif kind == "dt_writeback":
                 info = dict(payload)
                 self._log(
