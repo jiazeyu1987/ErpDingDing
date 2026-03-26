@@ -29,6 +29,7 @@ DEFAULT_MAPPING_DB = r"D:\ProjectPackage\demo\erp_demo\erp_dingtalk_links.db"
 
 PURCHASE_FIELD_KEYS = (
     "FID,FBillNo,FDate,FCreateDate,FModifyDate,FDocumentStatus,"
+    "FCreatorId,"
     "FPurchaseOrgId.FNumber,FSupplierId.FNumber,FSupplierId.FName,"
     "FMaterialId.FNumber,FMaterialId.FName,FQty,FReceiveQty,FSrcBillNo"
 )
@@ -137,6 +138,21 @@ def first_non_empty(*values: Any) -> str:
     return ""
 
 
+def parse_bool_text(value: Any, default: bool = False) -> bool:
+    text = first_non_empty(value).lower()
+    if not text:
+        return default
+    if text in {"1", "true", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "no", "n", "off"}:
+        return False
+    return default
+
+
+def normalize_user_map_key(value: Any) -> str:
+    return to_text(value).strip().lower()
+
+
 def parse_id_value_items(items: list[str], flag: str) -> list[tuple[str, str]]:
     parsed: list[tuple[str, str]] = []
     for raw in items:
@@ -149,6 +165,29 @@ def parse_id_value_items(items: list[str], flag: str) -> list[tuple[str, str]]:
             raise RuntimeError(f"{flag} has empty component id: {raw}")
         parsed.append((cid, template))
     return parsed
+
+
+def parse_user_map_items(items: list[str], flag: str) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for raw in items:
+        text = to_text(raw).strip()
+        if not text:
+            continue
+        segments: list[str] = []
+        for part in text.replace(";", ",").split(","):
+            part = part.strip()
+            if part:
+                segments.append(part)
+        for seg in segments:
+            if "=" not in seg:
+                raise RuntimeError(f"{flag} requires ERP_KEY=DINGTALK_USER_ID, got: {seg}")
+            key, val = seg.split("=", 1)
+            key = normalize_user_map_key(key)
+            val = to_text(val).strip()
+            if not key or not val:
+                raise RuntimeError(f"{flag} has empty key/value: {seg}")
+            out[key] = val
+    return out
 
 
 @dataclass(frozen=True)
@@ -277,6 +316,10 @@ class ErpClient:
         if filter_str:
             query["FilterString"] = filter_str
         raw = self.execute_bill_query_retry(query)
+        if isinstance(raw, list) and raw and isinstance(raw[0], dict) and "Result" in raw[0]:
+            status = raw[0].get("Result", {}).get("ResponseStatus", {})
+            err = status.get("Errors") or status or raw[0]
+            raise RuntimeError(f"ExecuteBillQuery returned error payload: {err}")
         return k3.rows_to_dicts(raw, PURCHASE_FIELD_KEYS)
 
 
@@ -333,6 +376,10 @@ def build_order_context(order_rows: list[dict[str, Any]], timestamp: str) -> tup
         "FCreateDate": to_text(header.get("FCreateDate")).strip(),
         "FModifyDate": to_text(header.get("FModifyDate")).strip(),
         "FDocumentStatus": to_text(header.get("FDocumentStatus")).strip(),
+        "CreatorId": to_text(header.get("FCreatorId")).strip(),
+        # Some ERP versions do not expose FCreatorId.FNumber/FName in ExecuteBillQuery.
+        "CreatorNo": to_text(header.get("FCreatorId")).strip(),
+        "CreatorName": to_text(header.get("FCreatorId.FName")).strip(),
         "OrgNo": to_text(header.get("FPurchaseOrgId.FNumber")).strip(),
         "SupplierNo": to_text(header.get("FSupplierId.FNumber")).strip(),
         "SupplierName": to_text(header.get("FSupplierId.FName")).strip(),
@@ -414,6 +461,8 @@ class DingTalkConfig:
     app_secret: str
     process_code: str
     originator_user_id: str
+    originator_from_po_creator: bool
+    originator_map: dict[str, str]
     dept_id: int
     approvers: list[str]
     cc_list: list[str]
@@ -519,6 +568,28 @@ class DingTalkTopApiClient:
             raise RuntimeError("DingTalk form values are empty")
         return values
 
+    def resolve_originator_user_id(self, order_ctx: dict[str, Any]) -> tuple[str, str]:
+        default_id = self.config.originator_user_id
+        if not self.config.originator_from_po_creator:
+            return default_id, "fixed by config"
+
+        candidates = [
+            ("CreatorId", to_text(order_ctx.get("CreatorId")).strip()),
+            ("CreatorNo", to_text(order_ctx.get("CreatorNo")).strip()),
+            ("CreatorName", to_text(order_ctx.get("CreatorName")).strip()),
+        ]
+        for source, raw in candidates:
+            if not raw:
+                continue
+            mapped = self.config.originator_map.get(normalize_user_map_key(raw), "")
+            if mapped:
+                return mapped, f"mapped from {source}={raw}"
+
+        hint = ", ".join(f"{src}={val}" for src, val in candidates if val)
+        if hint:
+            return default_id, f"fallback default (creator not mapped: {hint})"
+        return default_id, "fallback default (creator empty)"
+
     def create_instance(self, order_ctx: dict[str, Any], line_ctx_list: list[dict[str, Any]]) -> dict[str, Any]:
         token = self.get_token()
         schema = self.get_schema(token)
@@ -529,10 +600,11 @@ class DingTalkTopApiClient:
             components=components,
             table_children=table_children,
         )
+        originator_user_id, originator_reason = self.resolve_originator_user_id(order_ctx)
 
         payload: dict[str, Any] = {
             "process_code": self.config.process_code,
-            "originator_user_id": self.config.originator_user_id,
+            "originator_user_id": originator_user_id,
             "dept_id": str(self.config.dept_id),
             "form_component_values": json.dumps(form_values, ensure_ascii=False),
         }
@@ -553,7 +625,12 @@ class DingTalkTopApiClient:
         instance_id = to_text(create_resp.get("process_instance_id")).strip()
         if not instance_id:
             raise RuntimeError(f"DingTalk response missing process_instance_id: {json.dumps(create_resp, ensure_ascii=False)}")
-        return {"processInstanceId": instance_id, "createResponse": create_resp}
+        return {
+            "processInstanceId": instance_id,
+            "createResponse": create_resp,
+            "originatorUserId": originator_user_id,
+            "originatorReason": originator_reason,
+        }
 
 
 def build_dingtalk_config(args: argparse.Namespace) -> tuple[DingTalkConfig | None, str]:
@@ -571,6 +648,17 @@ def build_dingtalk_config(args: argparse.Namespace) -> tuple[DingTalkConfig | No
     originator_user_id = resolve("DINGTALK_ORIGINATOR_USER_ID", args.dingtalk_originator_user_id)
     dept_id_text = resolve("DINGTALK_DEPT_ID", args.dingtalk_dept_id)
     api_base = resolve("DINGTALK_API_BASE", args.dingtalk_api_base) or DEFAULT_DINGTALK_API_BASE
+    env_originator_map = resolve("DINGTALK_ORIGINATOR_MAP", "")
+    from_po_creator = args.dingtalk_originator_from_po_creator
+    if from_po_creator is None:
+        from_po_creator = parse_bool_text(resolve("DINGTALK_ORIGINATOR_FROM_PO_CREATOR", "1"), True)
+    try:
+        originator_map: dict[str, str] = {}
+        if env_originator_map:
+            originator_map.update(parse_user_map_items([env_originator_map], "DINGTALK_ORIGINATOR_MAP"))
+        originator_map.update(parse_user_map_items(args.dingtalk_originator_map, "--dingtalk-originator-map"))
+    except Exception as exc:  # noqa: BLE001
+        return None, f"invalid originator map: {exc}"
 
     missing: list[str] = []
     if not app_key:
@@ -606,6 +694,8 @@ def build_dingtalk_config(args: argparse.Namespace) -> tuple[DingTalkConfig | No
         app_secret=app_secret,
         process_code=process_code,
         originator_user_id=originator_user_id,
+        originator_from_po_creator=bool(from_po_creator),
+        originator_map=originator_map,
         dept_id=dept_id,
         approvers=[x.strip() for x in args.dingtalk_approver if x.strip()],
         cc_list=[x.strip() for x in args.dingtalk_cc if x.strip()],
@@ -650,6 +740,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dingtalk-app-secret", default="")
     parser.add_argument("--dingtalk-process-code", default="")
     parser.add_argument("--dingtalk-originator-user-id", default="")
+    parser.add_argument(
+        "--dingtalk-originator-map",
+        action="append",
+        default=[],
+        metavar="ERP_CREATOR_KEY=DINGTALK_USER_ID",
+        help="Map ERP creator (name/no/id) to DingTalk userId. Repeatable.",
+    )
+    parser.add_argument(
+        "--dingtalk-originator-from-po-creator",
+        dest="dingtalk_originator_from_po_creator",
+        action="store_true",
+        default=None,
+        help="Use ERP purchase-order creator as DingTalk originator (by mapping).",
+    )
+    parser.add_argument(
+        "--dingtalk-no-originator-from-po-creator",
+        dest="dingtalk_originator_from_po_creator",
+        action="store_false",
+        help="Disable creator mapping and always use --dingtalk-originator-user-id.",
+    )
     parser.add_argument("--dingtalk-dept-id", default="")
     parser.add_argument("--dingtalk-approver", action="append", default=[])
     parser.add_argument("--dingtalk-cc", action="append", default=[])
@@ -737,6 +847,8 @@ def main() -> int:
             "intervalSec": args.interval,
             "fromNow": args.from_now,
             "dingtalk": "enabled" if dingtalk_client else f"disabled ({dingtalk_state})",
+            "originatorFromPoCreator": bool(dingtalk_cfg.originator_from_po_creator) if dingtalk_cfg else False,
+            "originatorMapCount": len(dingtalk_cfg.originator_map) if dingtalk_cfg else 0,
             "mappingDb": "" if args.disable_link_db else args.mapping_db,
         }
     )
@@ -798,6 +910,9 @@ def main() -> int:
                         "orgNo": order_ctx.get("OrgNo", ""),
                         "supplierNo": order_ctx.get("SupplierNo", ""),
                         "supplierName": order_ctx.get("SupplierName", ""),
+                        "creatorId": order_ctx.get("CreatorId", ""),
+                        "creatorNo": order_ctx.get("CreatorNo", ""),
+                        "creatorName": order_ctx.get("CreatorName", ""),
                         "lineCount": order_ctx.get("LineCount", "0"),
                         "totalQty": order_ctx.get("TotalQty", "0"),
                         "status": order_ctx.get("FDocumentStatus", ""),
@@ -816,6 +931,8 @@ def main() -> int:
                                 "fid": fid,
                                 "billNo": order_ctx.get("FBillNo", ""),
                                 "processInstanceId": create_result["processInstanceId"],
+                                "originatorUserId": create_result.get("originatorUserId", ""),
+                                "originatorReason": create_result.get("originatorReason", ""),
                             }
                         )
                         if not args.disable_link_db:

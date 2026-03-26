@@ -46,6 +46,8 @@ DEFAULT_ENV_FILE = r"D:\ProjectPackage\demo\dingding_demo\code\.env"
 DEFAULT_MAPPING_DB = r"D:\ProjectPackage\demo\erp_demo\erp_dingtalk_links.db"
 DEFAULT_DINGTALK_ORIGINATOR_ID = "025247281136343306"
 DEFAULT_DINGTALK_APPROVER_ID = "143908412435636200"
+DEFAULT_DINGTALK_PROCESS_CODE = "PROC-AF23EB1A-0CF7-4E87-8D07-6D56ED194AA4"
+DEFAULT_APPROVER_SOURCE_MODE = "使用ProcessCode（默认）"
 
 DEFAULT_ERP_BASE_URL = "http://172.30.30.8"
 DEFAULT_ERP_ACCT_ID = "6977227150362f"
@@ -59,6 +61,18 @@ DINGTALK_USER_CHOICES: list[tuple[str, str]] = [
 ]
 DINGTALK_USER_NAME_TO_ID = {name: uid for name, uid in DINGTALK_USER_CHOICES}
 DINGTALK_USER_ID_TO_NAME = {uid: name for name, uid in DINGTALK_USER_CHOICES}
+# ERP creator key -> DingTalk userId.
+# Key can be ERP creator id / creator number / creator name.
+DINGTALK_ERP_CREATOR_TO_USER_ID: dict[str, str] = {
+    "6157952": "143908412435636200",  # 贾泽宇
+}
+DINGTALK_PROCESS_CODE_CHOICES: list[str] = [
+    DEFAULT_DINGTALK_PROCESS_CODE,
+]
+APPROVER_SOURCE_MODE_CHOICES: list[str] = [
+    "使用ProcessCode（默认）",
+    "使用UI审批人",
+]
 ERP_WATCH_FIELD_KEYS = (
     "FID,FBillNo,FDate,FCreateDate,FModifyDate,FDocumentStatus,"
     "FPurchaseOrgId.FNumber,FSupplierId.FNumber,FSupplierId.FName,FMaterialId.FNumber,FQty"
@@ -392,6 +406,8 @@ class CallbackMonitorGUI(tk.Tk):
         self.quick_approver_name_var = tk.StringVar(
             value=DINGTALK_USER_ID_TO_NAME.get(DEFAULT_DINGTALK_APPROVER_ID, DINGTALK_USER_CHOICES[0][0])
         )
+        self.quick_process_code_var = tk.StringVar(value=DEFAULT_DINGTALK_PROCESS_CODE)
+        self.quick_approver_source_mode_var = tk.StringVar(value=DEFAULT_APPROVER_SOURCE_MODE)
         self.create_supplier_no_var = tk.StringVar(value="INT-010")
         self.create_materials_var = tk.StringVar(value="YXN.004.012.1003")
         self.create_qty_min_var = tk.StringVar(value="1")
@@ -405,6 +421,13 @@ class CallbackMonitorGUI(tk.Tk):
     def _selected_approver_id(self) -> str:
         name = self.quick_approver_name_var.get().strip()
         return DINGTALK_USER_NAME_TO_ID.get(name, DEFAULT_DINGTALK_APPROVER_ID)
+
+    def _selected_process_code(self) -> str:
+        code = self.quick_process_code_var.get().strip()
+        return code or DEFAULT_DINGTALK_PROCESS_CODE
+
+    def _use_ui_approver_override(self) -> bool:
+        return self.quick_approver_source_mode_var.get().strip() == "使用UI审批人"
 
     def _build_ui(self) -> None:
         root_tabs = ttk.Notebook(self)
@@ -434,6 +457,26 @@ class CallbackMonitorGUI(tk.Tk):
             q_row0,
             textvariable=self.quick_approver_name_var,
             values=people_names,
+            state="readonly",
+            width=20,
+        ).pack(side=tk.LEFT, padx=8)
+
+        q_row0b = ttk.Frame(quick)
+        q_row0b.pack(fill=tk.X, pady=6)
+        ttk.Label(q_row0b, text="流程ProcessCode").pack(side=tk.LEFT)
+        self.quick_process_code_combo = ttk.Combobox(
+            q_row0b,
+            textvariable=self.quick_process_code_var,
+            values=DINGTALK_PROCESS_CODE_CHOICES,
+            state="readonly",
+            width=46,
+        )
+        self.quick_process_code_combo.pack(side=tk.LEFT, padx=8)
+        ttk.Label(q_row0b, text="审批来源").pack(side=tk.LEFT, padx=(20, 0))
+        ttk.Combobox(
+            q_row0b,
+            textvariable=self.quick_approver_source_mode_var,
+            values=APPROVER_SOURCE_MODE_CHOICES,
             state="readonly",
             width=20,
         ).pack(side=tk.LEFT, padx=8)
@@ -748,6 +791,16 @@ class CallbackMonitorGUI(tk.Tk):
         env_approver = cb.first_non_empty(env.get("DINGTALK_APPROVER_USER_ID"), env.get("DINGTALK_APPROVER"))
         if env_approver in DINGTALK_USER_ID_TO_NAME:
             self.quick_approver_name_var.set(DINGTALK_USER_ID_TO_NAME[env_approver])
+        env_process_code = cb.first_non_empty(env.get("DINGTALK_PROCESS_CODE"))
+        if env_process_code:
+            choices = list(DINGTALK_PROCESS_CODE_CHOICES)
+            if env_process_code not in choices:
+                choices.append(env_process_code)
+                try:
+                    self.quick_process_code_combo.configure(values=choices)
+                except Exception:
+                    pass
+            self.quick_process_code_var.set(env_process_code)
         self.cb_token_var.set(cb.first_non_empty(env.get("DINGTALK_CALLBACK_TOKEN"), self.cb_token_var.get()))
         self.cb_aes_var.set(cb.first_non_empty(env.get("DINGTALK_CALLBACK_AES_KEY"), self.cb_aes_var.get()))
         self.erp_field_status_var.set(cb.first_non_empty(env.get("ERP_DD_FIELD_STATUS"), self.erp_field_status_var.get()))
@@ -1082,13 +1135,20 @@ class CallbackMonitorGUI(tk.Tk):
                 "--dingtalk-enable",
                 "--dingtalk-env-file",
                 self.env_file_var.get().strip(),
+                "--dingtalk-process-code",
+                self._selected_process_code(),
                 "--dingtalk-originator-user-id",
                 self._selected_originator_id(),
+                "--dingtalk-originator-from-po-creator",
                 "--mapping-db",
                 self.mapping_db_var.get().strip(),
-                "--dingtalk-approver",
-                self._selected_approver_id(),
             ]
+            for user_name, user_id in DINGTALK_USER_CHOICES:
+                cmd.extend(["--dingtalk-originator-map", f"{user_name}={user_id}"])
+            for creator_key, user_id in DINGTALK_ERP_CREATOR_TO_USER_ID.items():
+                cmd.extend(["--dingtalk-originator-map", f"{creator_key}={user_id}"])
+            if self._use_ui_approver_override():
+                cmd.extend(["--dingtalk-approver", self._selected_approver_id()])
             if self.erp_insecure_var.get():
                 cmd.append("--insecure")
             if self.po_monitor_from_now_var.get():
@@ -1110,6 +1170,19 @@ class CallbackMonitorGUI(tk.Tk):
             self.po_stop_btn.configure(state=tk.NORMAL)
             self.po_monitor_status_var.set("PO->DingTalk: running")
             self._log(f"[{now_iso()}] PO monitor started")
+            self._log(f"[{now_iso()}] DingTalk originator source: ERP purchase-order creator (mapped), with UI originator as fallback")
+            self._log(
+                f"[{now_iso()}] DingTalk originator map loaded: "
+                f"{len(DINGTALK_USER_CHOICES) + len(DINGTALK_ERP_CREATOR_TO_USER_ID)} entries"
+            )
+            if self._use_ui_approver_override():
+                self._log(
+                    f"[{now_iso()}] DingTalk approver source: UI override "
+                    f"({self.quick_approver_name_var.get().strip()} / {self._selected_approver_id()})"
+                )
+            else:
+                self._log(f"[{now_iso()}] DingTalk approver source: process template (from processCode)")
+            self._log(f"[{now_iso()}] DingTalk processCode: {self._selected_process_code()}")
         except Exception as exc:  # noqa: BLE001
             messagebox.showerror("Start PO monitor failed", str(exc))
             self._log(f"[{now_iso()}] PO monitor start failed: {exc}")
